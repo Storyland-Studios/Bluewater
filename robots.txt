@@ -1,0 +1,12 @@
+# Google and Bing are allowed to FETCH so they see the noindex header/meta
+# and drop the URL from their index entirely. Blocking them here would stop
+# the crawl but leave the bare URL indexable if anyone links to it.
+User-agent: Googlebot
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+# Everyone else — AI scrapers, archivers, SEO crawlers — blocked outright.
+User-agent: *
+Disallow: /
