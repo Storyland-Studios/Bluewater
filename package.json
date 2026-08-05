@@ -1,0 +1,28 @@
+{
+  "name": "bluewater",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Nateland Experiences investor deck — the self-contained deck, plus the reader record behind it.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node scripts/test.mjs && node scripts/test-client.mjs",
+    "test:api": "node scripts/test.mjs",
+    "test:client": "node scripts/test-client.mjs",
+    "lint:php": "node scripts/lint-php.mjs",
+    "migrate": "node scripts/migrate.mjs",
+    "report": "node scripts/report.mjs",
+    "dev": "node scripts/dev.mjs",
+    "dev:vercel": "vercel dev"
+  },
+  "dependencies": {
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@electric-sql/pglite-socket": "^0.2.7",
+    "php-parser": "^3.7.0"
+  }
+}

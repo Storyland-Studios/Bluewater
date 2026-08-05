@@ -9,6 +9,15 @@
   Images are embedded as base64 WebP, so it works offline and survives
   being emailed or dropped into a data room.
 
+  ONE EXCEPTION, and it only applies to the hosted copy. Served over
+  http(s), the deck posts the sign-in details and the per-slide dwell
+  times to the API in /api, and reads the "across all readers" figures
+  on the closing read-back back out of it. Opened from a file, an email
+  attachment or anything that is not http(s), it does not reach for the
+  network at all and behaves exactly as the paragraph above describes.
+  The sign-in card tells the reader which of the two they are looking
+  at. See DATABASE.md, and the "the record" section in the script.
+
   ------------------------------------------------------------------
   DRIVING IT
   ------------------------------------------------------------------
@@ -3290,8 +3299,10 @@ body.no-motion .wr-next i{ animation:none; transform:scaleX(1); }
       <button class="gt-go" id="gateGo">Open the deck</button>
     </div>
     <p class="gt-small">Private and confidential. Not an offer of securities.
-      Nothing entered here is transmitted anywhere — it stays in this browser tab
-      and is used only to address you on the closing slide.</p>
+      What you enter here is recorded by Nateland Experiences, along with which
+      slides you open and how long you spend on each, so that we know who we are
+      speaking to and what you wanted to see. Your browser, screen size and time
+      zone are recorded with it, and where you followed the link from.</p>
   </div>
 </div>
 
@@ -5414,12 +5425,19 @@ function toggleBreakout(force){
    ------------------------------------------------------------------
    WHAT THIS IS AND IS NOT
 
-   The gate is a courtesy, not a control. Everything in this file runs
-   in the viewer's own browser: the form does not transmit anywhere,
-   and view-source or devtools reveals the whole deck without filling
-   it in. Treat it as "who shall I say is calling", not as access
-   control. Real gating needs a server and a data room — see the
-   README.
+   The gate is a courtesy, not a control. View-source or devtools
+   reveals the whole deck without filling it in, so treat it as "who
+   shall I say is calling", not as access control. Real gating needs
+   the passphrase never to reach the browser — see DATABASE.md.
+
+   What it is not is inert. The card used to say that nothing entered
+   into it was transmitted anywhere, and that was true; it is now
+   posted to /api/signin and kept, along with which slides were opened
+   and for how long. The copy on the card was rewritten in the same
+   change that added the recording. If the recording is ever taken out
+   again, that copy has to go back — a deck that tells an investor it
+   collects nothing while collecting something is a worse problem than
+   any missing analytics.
 
    Four fields only: name and email required, phone and firm
    optional. The dropdowns that captured role, type of capital, cheque
@@ -5437,7 +5455,8 @@ var SESSION = {
   _since: null,     /* when the current slide became active           */
   _current: null,
   visits: 1,
-  paused: false
+  paused: false,
+  recId: null       /* this browser's row in the reader record        */
 };
 
 /* ---- persistence -------------------------------------------------
@@ -5449,19 +5468,32 @@ var SESSION = {
 
    Wrapped in try/catch because some embedded viewers throw on storage access;
    there, it falls back to memory and behaves as it did before.
+
+   localStorage is still the source of truth for the reader's own experience,
+   and deliberately so: the read-back has to work on a plane. The record in
+   the next section is a mirror of this, not a replacement for it — every
+   write here is followed by a debounced write to the server, and if that
+   server is unreachable, or the file was opened from an email attachment,
+   nothing about the deck changes.
    ------------------------------------------------------------------ */
 var STORE_KEY = 'nateland-deck-session-v1';
 var storeOK = true;
 
 function sessionSave(){
-  if(!storeOK) return;
-  try {
-    window.localStorage.setItem(STORE_KEY, JSON.stringify({
-      name: SESSION.name, firstName: SESSION.firstName, email: SESSION.email,
-      phone: SESSION.phone, org: SESSION.org, signedInAt: SESSION.signedInAt,
-      dwell: SESSION.dwell, order: SESSION.order, visits: SESSION.visits
-    }));
-  } catch(e){ storeOK = false; }
+  if(storeOK){
+    try {
+      window.localStorage.setItem(STORE_KEY, JSON.stringify({
+        name: SESSION.name, firstName: SESSION.firstName, email: SESSION.email,
+        phone: SESSION.phone, org: SESSION.org, signedInAt: SESSION.signedInAt,
+        dwell: SESSION.dwell, order: SESSION.order, visits: SESSION.visits,
+        recId: SESSION.recId
+      }));
+    } catch(e){ storeOK = false; }
+  }
+  /* Mirror it. Debounced inside, so calling this on every slide change —
+     which is what dwellCommit does — costs one request every few seconds
+     rather than one per slide. */
+  recBeat();
 }
 
 function sessionLoad(){
@@ -5469,7 +5501,7 @@ function sessionLoad(){
     var raw = window.localStorage.getItem(STORE_KEY);
     if(!raw) return false;
     var d = JSON.parse(raw);
-    ['name','firstName','email','phone','org','signedInAt'].forEach(function(k){
+    ['name','firstName','email','phone','org','signedInAt','recId'].forEach(function(k){
       if(d[k]) SESSION[k] = d[k];
     });
     SESSION.dwell  = d.dwell  || {};
@@ -5482,8 +5514,323 @@ function sessionLoad(){
 function sessionClear(){
   SESSION.dwell = {}; SESSION.order = []; SESSION.visits = 1;
   SESSION._current = null; SESSION._since = null;
+  /* A cleared session starts a new row rather than rewriting the old one to
+     zero — the server's totals only ever climb, so the read that already
+     happened stays recorded and the next one is counted separately. */
+  SESSION.recId = null;
+  REC.identified = false;
+  REC.last = '';
   try { window.localStorage.removeItem(STORE_KEY); } catch(e){}
 }
+
+/* ---- the record --------------------------------------------------
+   Everything above this line works with no server, and still does. This
+   section mirrors it to a database so that the sign-in card is worth
+   filling in, and so the "across all readers" column on the read-back can
+   report real readers instead of the sample figures it used to carry.
+
+   Three rules hold the design together:
+
+   1. The deck never depends on the server. Every request is fire and
+      forget; nothing waits on a response, nothing breaks when one does not
+      come. Opened from an email attachment on a plane, this whole section
+      switches itself off and the deck behaves exactly as it did before it
+      existed.
+
+   2. Every send is the whole absolute state, never a delta. So a lost
+      request costs nothing — the next one carries the same truth — and a
+      retry or a duplicated beacon cannot double-count. The server takes
+      the larger of what it has and what arrives, which also means a
+      request that overtakes another cannot walk a total backwards.
+
+   3. The reader is told. The sign-in card says what is recorded, because
+      it used to promise the opposite and a deck that lies to an investor
+      on its first screen is not worth the analytics.
+
+   Where the endpoints live: the deck is served both from Vercel and from
+   storylandstudios.com/bluewater through the WordPress proxy, and that
+   proxy only forwards GET. A POST from the proxied copy therefore has to
+   go straight to Vercel, cross-origin, which the API allows by name.
+   ------------------------------------------------------------------ */
+
+/* Update this if the Vercel project is ever renamed. Deployments of this
+   project answer on their own origin and never use it. */
+var API_ORIGIN = 'https://bluewater-tau.vercel.app';
+
+function uuid(){
+  try {
+    if(window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+  } catch(e){}
+  /* Math.random is fine: this names one row, it does not protect anything. */
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
+    var r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+/* null means "do not reach for the network at all". file: and blob: are the
+   emailed copy, which the README promises works offline and which must stay
+   that way. Any *.vercel.app host is one of this project's own deployments,
+   production or preview, and can use a relative path — so a preview writes
+   to whichever database that preview is configured with, rather than to
+   production. Everything else is the proxy, and posts to Vercel by name. */
+function recResolveBase(){
+  if(location.protocol !== 'http:' && location.protocol !== 'https:') return null;
+  var h = location.hostname;
+  if(h === 'localhost' || h === '127.0.0.1' || /\.vercel\.app$/.test(h)) return '';
+  return API_ORIGIN;
+}
+
+var REC = {
+  base: recResolveBase(),
+  identified: false,     /* the server has a row for SESSION.recId          */
+  viewerId: null,
+  queue: [],             /* events not yet acknowledged                     */
+  timer: null,
+  failures: 0,           /* consecutive dead connections                    */
+  mutedUntil: 0,         /* muted after too many of those, until this time  */
+  reidentifies: 0,       /* consecutive unresolved 409s — see recFlush      */
+  signinTries: 0,        /* retries of a failed sign-in                     */
+  signinPending: false,  /* one sign-in in flight at a time                 */
+  last: '',              /* signature of the last payload sent              */
+  wrapOpened: false,
+  stats: null            /* real benchmark, once there is enough of one     */
+};
+
+var BEAT_MS      = 4000; /* how long a change waits before it is sent       */
+var REC_GIVE_UP  = 4;    /* dead connections before it goes quiet           */
+var REC_MUTE_MS  = 60000;/* and how long it stays quiet for                 */
+var REC_MAX_REIDENTIFY = 2;  /* 409 recoveries before it stops for good     */
+var REC_MAX_SIGNIN     = 3;  /* retries of a sign-in that did not land      */
+
+function recLive(){
+  if(REC.base === null) return false;
+  if(REC.failures < REC_GIVE_UP) return true;
+
+  /* Quiet for a minute, not for good. This used to latch off permanently:
+     four dead connections and the deck stopped recording until the page was
+     reloaded. A reader on a train goes through tunnels, and a deck open for an
+     hour should not lose the other fifty-nine minutes because of the first
+     one. After the cooldown one attempt gets through; if the network is still
+     gone it simply mutes again, so there is no hammering either.
+
+     No timer is needed to drive this. recBeat runs on every slide change and
+     recFlush runs on pagehide, so a reader who is still reading will re-arm it
+     by reading, and a reader who has stopped has nothing left to report. */
+  if(Date.now() < REC.mutedUntil) return false;
+  REC.failures = 0;
+  return true;
+}
+
+function recPost(path, body, beacon){
+  if(!recLive()) return Promise.resolve({ ok:false, status:0 });
+
+  var url = REC.base + path;
+  var payload = JSON.stringify(body);
+
+  /* A closing tab will not finish a fetch. sendBeacon hands the request to
+     the browser to deliver after the page is gone; the blob carries a JSON
+     content type so it is parsed as JSON at the other end. */
+  if(beacon && navigator.sendBeacon){
+    try {
+      if(navigator.sendBeacon(url, new Blob([payload], { type:'application/json' })))
+        return Promise.resolve({ ok:true, status:0 });
+    } catch(e){}
+  }
+
+  return fetch(url, {
+    method: 'POST',
+    mode: 'cors',
+    keepalive: !!beacon,
+    headers: { 'Content-Type': 'application/json' },
+    body: payload
+  }).then(function(r){
+    return r.json().catch(function(){ return null; }).then(function(d){
+      /* A refusal still means the server answered, so it does not count
+         towards giving up. Only an unreachable one does. */
+      REC.failures = 0;
+      return { ok: r.ok, status: r.status, data: d };
+    });
+  }).catch(function(){
+    REC.failures++;
+    if(REC.failures >= REC_GIVE_UP) REC.mutedUntil = Date.now() + REC_MUTE_MS;
+    return { ok:false, status:0 };
+  });
+}
+
+/* Called when the card is filled in, and again on every later visit — the
+   card is only shown once, so without the second call a returning reader
+   would never be counted twice. */
+/* Everything else here is guarded on REC.identified, which only a successful
+   sign-in sets — so a sign-in that does not land does not merely lose itself,
+   it silences the whole page. Every later beat no-ops, the pagehide beacon
+   no-ops, and the 409 recovery cannot help because it lives inside recFlush,
+   which is one of the things that has stopped running. One dropped reply and
+   the entire read goes unrecorded.
+
+   So it retries, bounded, backing off. Not on a 400: a validation refusal is
+   deterministic and will refuse the same way forever, so retrying it is pure
+   noise. Anything else — a 500, a dropped connection, a proxy hiccup, or a
+   request that committed server-side whose reply was lost — is worth another
+   go, and the upsert is idempotent so a duplicate costs nothing. */
+function recSignIn(returning){
+  if(!recLive() || !SESSION.email) return Promise.resolve(false);
+  if(REC.signinPending) return Promise.resolve(false);   /* one at a time */
+  if(!SESSION.recId){ SESSION.recId = uuid(); sessionSave(); }
+  REC.signinPending = true;
+
+  var tz = '';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e){}
+
+  return recPost('/api/signin', {
+    readId: SESSION.recId,
+    name: SESSION.name, firstName: SESSION.firstName, email: SESSION.email,
+    phone: SESSION.phone, org: SESSION.org,
+    visits: SESSION.visits,
+    slidesTotal: slides.length,
+    screen: window.screen ? (screen.width + 'x' + screen.height) : '',
+    tz: tz,
+    referrer: document.referrer || '',
+    returning: !!returning
+  }).then(function(r){
+    REC.signinPending = false;
+
+    if(r.ok && r.data && r.data.ok){
+      REC.identified = true;
+      REC.signinTries = 0;
+      REC.viewerId = r.data.viewerId;
+      recFlush(false);       /* send whatever accumulated while we waited */
+      recStats();            /* and warm the benchmark for the read-back  */
+      return true;
+    }
+
+    if(r.status !== 400 && REC.signinTries < REC_MAX_SIGNIN){
+      REC.signinTries++;
+      setTimeout(function(){ recSignIn(returning); }, 2000 * REC.signinTries);
+    }
+    return false;
+  });
+}
+
+function recPayload(){
+  var rows = [];
+  for(var k in SESSION.dwell){
+    rows.push({
+      i: +k,
+      ms: Math.round(SESSION.dwell[k]),
+      title: slideTitle(+k),
+      order: SESSION.order.indexOf(+k)
+    });
+  }
+  return {
+    readId: SESSION.recId,
+    totalMs: dwellSum(),
+    slidesSeen: SESSION.order.length,
+    slidesTotal: slides.length,
+    visits: SESSION.visits,
+    /* Opening the last slide is as much as the deck can know about
+       finishing. It cannot tell whether anything was read. */
+    finished: SESSION.order.indexOf(slides.length - 1) !== -1,
+    wrapOpened: REC.wrapOpened,
+    slides: rows,
+    events: REC.queue.slice(0)
+  };
+}
+
+function recBeat(){
+  if(!recLive() || !REC.identified || REC.timer) return;
+  REC.timer = setTimeout(function(){ REC.timer = null; recFlush(false); }, BEAT_MS);
+}
+
+function recFlush(beacon){
+  if(!recLive() || !REC.identified || !SESSION.recId) return;
+  if(REC.timer){ clearTimeout(REC.timer); REC.timer = null; }
+
+  var body = recPayload();
+  var sig = JSON.stringify([body.slides, body.totalMs, body.slidesSeen,
+                            body.finished, body.wrapOpened]);
+
+  /* Nothing has moved and no event is waiting, so there is nothing to say.
+     A beacon goes anyway: it is the last chance to bank the open slide. */
+  if(!beacon && sig === REC.last && !body.events.length) return;
+  REC.last = sig;
+
+  var sent = body.events.slice(0);
+  recPost('/api/beat', body, beacon).then(function(r){
+    if(r.ok){
+      REC.queue = REC.queue.filter(function(e){ return sent.indexOf(e) === -1; });
+      REC.reidentifies = 0;      /* the cycle below closed; start it fresh */
+      return;
+    }
+    if(r.status !== 409) return;
+
+    /* 409 means localStorage remembers a read the server has never heard
+       of — the sign-in request was lost, or the database was replaced
+       underneath us. Identify again; because the payload is absolute and
+       not a delta, the retry lands complete rather than partial.
+
+       BOUNDED, AND THAT IS THE WHOLE POINT. recSignIn calls recFlush on
+       success, and this is recFlush, so a server that answers 409 to every
+       beat turns those two into a closed cycle. It runs in promise
+       callbacks, so it never yields to the event loop: the tab pegs a core
+       and posts as fast as the network allows, indefinitely. A test that
+       held /api/beat at 409 hung the whole suite, which is exactly what a
+       reader's browser would do.
+
+       Two attempts, then stop for good. If signing in again has not fixed
+       it twice, it is not the kind of problem that signing in again fixes
+       — the row is being deleted as fast as we recreate it, or the two
+       requests are reaching different databases. Nothing the reader can
+       see depends on winning this, so the right move is to go quiet and
+       leave the deck to run from localStorage. */
+    if(REC.reidentifies >= REC_MAX_REIDENTIFY){ REC.base = null; return; }
+    REC.reidentifies++;
+    REC.identified = false;
+    REC.last = '';
+    recSignIn(true);
+  });
+
+  if(beacon) REC.queue = [];    /* the page is going; nothing will read it */
+}
+
+function recEvent(kind, meta){
+  if(REC.base === null) return;
+  REC.queue.push({
+    id: uuid(),
+    kind: String(kind).slice(0, 60),
+    slide: (typeof cur === 'number' ? cur : null),
+    meta: (meta && typeof meta === 'object') ? meta : null
+  });
+  /* Cap it. An event queue that grows without limit is a memory leak in a
+     deck someone leaves open all afternoon. */
+  if(REC.queue.length > 40) REC.queue.splice(0, REC.queue.length - 40);
+  recBeat();
+}
+
+/* ---- the benchmark ----------------------------------------------
+   The right-hand column of the summary card. MIN_REAL_READERS is a floor
+   for honesty more than for statistics: "median across two readers" is not
+   a benchmark, and showing one to an investor as though it were is worse
+   than showing nothing. Below the floor the card keeps the sample figures
+   and says, in as many words, that they are samples.
+   ------------------------------------------------------------------ */
+var MIN_REAL_READERS = 3;
+
+function recStats(){
+  if(!recLive()) return Promise.resolve(null);
+  return fetch(REC.base + '/api/stats?limit=5', { mode:'cors' })
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(d){
+      if(d && d.ok && d.viewers >= MIN_REAL_READERS && d.top && d.top.length){
+        REC.stats = d;
+      }
+      return d;
+    })
+    .catch(function(){ return null; });
+}
+
+function benchData(){ return REC.stats || BENCH_SAMPLE; }
+function benchIsReal(){ return !!REC.stats; }
 
 /* ---- dwell accounting ------------------------------------------- */
 function dwellCommit(){
@@ -5501,20 +5848,65 @@ function dwellEnter(i){
   SESSION._since = Date.now();
   if(SESSION.order.indexOf(i) === -1){ SESSION.order.push(i); sessionSave(); }
 }
-function dwellPause(){ if(!SESSION.paused){ dwellCommit(); SESSION.paused = true;
-                                            SESSION._since = null; } }
-function dwellResume(){ if(SESSION.paused){ SESSION.paused = false;
-                                            SESSION._since = Date.now(); } }
-window.addEventListener('pagehide', function(){ dwellCommit(); });
+/* The clock has two independent reasons to be stopped — the tab is hidden,
+   and the read-back is open — and it used to track them in one boolean. So
+   tabbing away from an open summary card and back again cleared the
+   read-back's pause as well as the tab's, and the time spent reading the
+   summary started banking against whichever slide happened to be open last.
+   The summary card is pushed with hold:true and never advances on its own, so
+   that could run for as long as someone left it up.
+
+   It also matters that the server cannot undo it: every total is written with
+   greatest(), deliberately, so an inflated dwell is permanent. This has to be
+   correct here or not at all.
+
+   So: name the reason, and let the clock run only when no reason is holding
+   it. Adding a third reason later means adding a key, not rethinking this. */
+var dwellHold = { hidden: false, wrap: false };
+
+function dwellPause(why){
+  dwellHold[why] = true;
+  if(!SESSION.paused){
+    dwellCommit();
+    SESSION.paused = true;
+    SESSION._since = null;
+  }
+}
+function dwellResume(why){
+  dwellHold[why] = false;
+  if(dwellHold.hidden || dwellHold.wrap) return;   /* something else still holds it */
+  if(SESSION.paused){
+    SESSION.paused = false;
+    SESSION._since = Date.now();
+  }
+}
+
+window.addEventListener('pagehide', function(){ dwellCommit(); recFlush(true); });
 document.addEventListener('visibilitychange', function(){
-  document.hidden ? dwellPause() : dwellResume();
+  if(document.hidden){
+    /* dwellPause banks the open slide. Flush it now rather than waiting for
+       pagehide, which a phone switching apps may never fire. Not a beacon:
+       the page is still alive and may well come back. */
+    dwellPause('hidden');
+    recFlush(false);
+  } else {
+    dwellResume('hidden');
+  }
 });
 
-function dwellTotal(){
-  dwellCommit();
+/* Two of these on purpose. dwellSum only adds up what is already banked;
+   dwellTotal banks the open slide first and is what the read-back wants.
+   The record must use the plain sum, because committing calls sessionSave,
+   which schedules another send, which would build another payload — a beat
+   every few seconds for as long as the tab is open, forever. */
+function dwellSum(){
   var t = 0;
   for(var k in SESSION.dwell) t += SESSION.dwell[k];
   return t;
+}
+function dwellTotal(){
+  dwellCommit();
+  return dwellSum();
 }
 function dwellRanked(){
   dwellCommit();
@@ -5633,6 +6025,9 @@ function gateSubmit(){
   SESSION.firstName = SESSION.name.trim().split(/\s+/)[0] || SESSION.name;
   SESSION.signedInAt = Date.now();
   sessionSave();
+  /* Not awaited. The deck opens on the reader's click, not on a round trip,
+     and if the request never lands the only thing lost is the record. */
+  recSignIn(false);
   closeGate();
   return true;
 }
@@ -5666,18 +6061,26 @@ function paintPersonalisation(){
    hints at it — you have to know to press N on the final slide.
    ------------------------------------------------------------------ */
 
-/* Sample benchmark figures. NOT REAL ANALYTICS — nothing is collected or
-   transmitted by this file. They stand in for what a hosted version would
-   report, so the sequence can be designed and demonstrated. */
+/* The fallback for the benchmark column, and no longer the only option:
+   /api/stats returns the same shape from the reader record, and benchData()
+   prefers it once at least MIN_REAL_READERS people have read the deck.
+
+   These figures stay because something has to fill the column before that
+   — on the emailed copy, which has no server to ask, and on the first few
+   real reads, where a median across two people would be worse than
+   invented. Whenever they are what is on screen, the footnote under them
+   says so. Keep them plausible rather than flattering, and keep the shape
+   identical to the endpoint's: viewers, medianTotalMs, medianSlidesSeen,
+   and top[] of { slide, title, ms }. */
 var BENCH_SAMPLE = {
   viewers: 34,
   medianTotalMs: 11 * 60 * 1000 + 20 * 1000,
   top: [
-    { title: 'Economic projections',    slide: 22, avgMs: 96 * 1000 },
-    { title: 'Attendance methodology',  slide: 21, avgMs: 74 * 1000 },
-    { title: 'Independent validation',  slide: 17, avgMs: 68 * 1000 },
-    { title: 'Site strategy',           slide: 20, avgMs: 61 * 1000 },
-    { title: 'The team',                slide: 16, avgMs: 55 * 1000 }
+    { title: 'Economic projections',    slide: 22, ms: 96 * 1000 },
+    { title: 'Attendance methodology',  slide: 21, ms: 74 * 1000 },
+    { title: 'Independent validation',  slide: 17, ms: 68 * 1000 },
+    { title: 'Site strategy',           slide: 20, ms: 61 * 1000 },
+    { title: 'The team',                slide: 16, ms: 55 * 1000 }
   ],
   medianSlidesSeen: 24
 };
@@ -5724,21 +6127,51 @@ function slideTitle(i){
   return slides[i] ? (slides[i].dataset.title || 'Slide ' + (i + 1)) : '—';
 }
 
+/* A slide counts as READ, rather than merely opened, at more than ten seconds
+   on it. Opening a slide costs one arrow press, so the opened count mostly
+   measures how far someone scrolled; ten seconds is about the least you can
+   spend on one of these slides and have taken anything from it, which makes it
+   the more honest figure to put in front of the reader.
+
+   The read-back now quotes this figure and not the opened count, on both
+   cards. The opened count is still recorded — recPayload sends
+   SESSION.order.length as slidesSeen — because "reached" and "read" are
+   different facts and the database should hold the raw one. A read count can
+   always be recomputed from the per-slide times; a discarded opened count
+   cannot. So the deck shows the more honest number and the record keeps both. */
+var READ_MS = 10000;
+
+function slidesRead(){
+  var n = 0;
+  for(var k in SESSION.dwell) if(SESSION.dwell[k] > READ_MS) n++;
+  return n;
+}
+
 /* Each card: a ground colour, a kicker, a hero value, and a line under it.
    `count` marks the hero for the count-up; `extra` is optional markup. */
 function wrapCards(){
   var ranked = dwellRanked();
   var total  = dwellTotal();
-  var seen   = SESSION.order.length;
+  var read   = slidesRead();
   var who    = SESSION.firstName || 'there';
-  var bs     = BENCH_SAMPLE;
+  var bs     = benchData();
   var cards  = [];
 
   cards.push({ tone:'ink', kicker:'One more thing', fillBtn:true,
-    hero: 'Congrats ' + who + ', you read the deck.', heroSmall:true,
+    hero: 'Congrats ' + esc(who) + ', you read the deck.', heroSmall:true,
+    /* The read count, so this agrees with the tile on the summary card rather
+       than quoting a larger number seconds before it.
+
+       Nothing is claimed when the count is nil. It can be: arrow through to the
+       last slide without stopping and no slide clears ten seconds, which would
+       have this card say "you read the deck" and "read 0 of 28 slides" in the
+       same breath — which reads as a bug rather than as candour. Better to
+       report the time and leave it there.
+
+       "and read" rather than a second "across", which the old line had twice. */
     line: 'You spent <b>' + fmtDur(total) + '</b> in the deck' +
           (SESSION.visits > 1 ? ' across ' + SESSION.visits + ' visits' : '') +
-          ', across ' + seen + ' of ' + slides.length + ' slides.' });
+          (read > 0 ? ', and read ' + read + ' of ' + slides.length + ' slides.' : '.') });
 
   /* The last card collects everything, so it can be read or captured in one go.
      It does not auto-advance. */
@@ -5751,7 +6184,7 @@ function wrapCards(){
     var pc = total ? Math.round(r.ms / total * 100) : 0;
     return '<li tabindex="0" role="link" data-goto="' + (r.i + 1) +
            '" title="Open slide ' + (r.i + 1) + '"><b>' + (r.i + 1) + '</b>' +
-           thumbFor(r.i) + '<span>' + slideTitle(r.i) + '</span><i>' +
+           thumbFor(r.i) + '<span>' + esc(slideTitle(r.i)) + '</span><i>' +
            fmtDur(r.ms) + '</i><u style="width:' + pc + '%"></u></li>';
   }).join('');
 
@@ -5760,30 +6193,67 @@ function wrapCards(){
     return '<span tabindex="0" role="link" data-goto="' + (i + 1) +
            '" title="Open slide ' + (i + 1) + '"><i style="height:' +
            Math.max(6, Math.round(ms / max * 100)) + '%"></i><b>' + (i + 1) + '</b>' +
-           '<u>' + slideTitle(i) + '<em>' + fmtDur(ms) + '</em>' + thumbFor(i) +
+           '<u>' + esc(slideTitle(i)) + '<em>' + fmtDur(ms) + '</em>' + thumbFor(i) +
            '</u></span>';
   }).join('');
 
   cards.push({ tone:'cream', layout:'summary', hold:true, who:who,
-    total:total, seen:seen, ranked:ranked,
-    topRows:topRows, routeStrip:routeStrip, bench:bs });
+    total:total, read:read, ranked:ranked,
+    topRows:topRows, routeStrip:routeStrip,
+    bench:bs, benchReal:benchIsReal() });
 
   return cards;
+}
+
+/* ---- escaping, for the one place text is not ours ------------------
+   Everything the summary card says about OTHER readers comes from
+   /api/stats, and what fills that endpoint is /api/beat, which by
+   necessity accepts writes from anyone who can reach it — the deck is a
+   static file with no secret to authenticate with. So a slide title
+   arriving from the server is attacker-controlled text on its way into
+   innerHTML. That is stored XSS, and it would run in this origin, where
+   localStorage is holding the reader's name, email, phone and firm.
+
+   Escaped at the sink rather than filtered on the way in, for two
+   reasons: it also covers rows already sitting in the database, and a
+   title is entitled to contain an ampersand.
+
+   The reader's own rows do not come from the server — those titles are
+   read from the deck's own data-title attributes and are as trustworthy
+   as the deck itself — but they go through esc() too, so that nobody
+   editing this has to work out which strings are which.
+   ------------------------------------------------------------------ */
+function esc(s){
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/* The numbers need the same suspicion: they are interpolated into
+   attributes and into arithmetic, so coerce rather than trust. */
+function num(v){
+  var n = Number(v);
+  return isFinite(n) ? n : 0;
 }
 
 function wrapSummaryHTML(c){
   var m = c.ranked.length ? c.ranked[0] : null;
   return '' +
     '<div class="wr-sum">' +
+      /* The head is a flex row justified to the edges, so document order is
+         left-to-right: the name leads and the label sits out on the right. */
       '<div class="wr-sum-head">' +
+        '<p class="wr-sum-name">' + esc(c.who) + '</p>' +
         '<p class="wr-sum-kicker">Your read of the deck</p>' +
-        '<p class="wr-sum-name">' + c.who + '</p>' +
       '</div>' +
 
       '<div class="wr-sum-tiles">' +
         '<div tabindex="0"><p class="k">Time in the deck</p><p class="v">' +
           fmtDur(c.total) + '</p></div>' +
-        '<div tabindex="0"><p class="k">Slides opened</p><p class="v">' + c.seen +
+        '<div tabindex="0"><p class="k">Slides read</p><p class="v">' + c.read +
           '<s>of ' + slides.length + '</s></p></div>' +
         '<div tabindex="0"><p class="k">Longest look</p><p class="v">' +
           (m ? fmtDur(m.ms) : '—') + '</p>' +
@@ -5802,14 +6272,20 @@ function wrapSummaryHTML(c){
           '<p class="wr-sum-lab">Across all readers</p>' +
           '<ol class="wr-sum-list is-quiet">' +
             c.bench.top.map(function(t){
-              return '<li tabindex="0" role="link" data-goto="' + t.slide +
-                     '" title="Open slide ' + t.slide + '"><b>' + t.slide +
-                     '</b>' + thumbFor(t.slide - 1) + '<span>' + t.title +
-                     '</span><i>' + fmtDur(t.avgMs) + '</i></li>'; }).join('') +
+              /* every field here came off the network — see esc() above */
+              var n = num(t.slide);
+              return '<li tabindex="0" role="link" data-goto="' + n +
+                     '" title="Open slide ' + n + '"><b>' + n +
+                     '</b>' + thumbFor(n - 1) + '<span>' +
+                     esc(t.title || 'Slide ' + n) +
+                     '</span><i>' + fmtDur(num(t.ms)) + '</i></li>'; }).join('') +
           '</ol>' +
-          '<p class="wr-sum-fine">Median read ' + fmtDur(c.bench.medianTotalMs) +
-            ' across ' + c.bench.viewers + ' readers. Sample figures — nothing ' +
-            'is collected by this file.</p>' +
+          '<p class="wr-sum-fine">Median read ' + fmtDur(num(c.bench.medianTotalMs)) +
+            ' across ' + num(c.bench.viewers) + ' readers' +
+            (c.benchReal
+              ? ' of this deck.'
+              : '. Sample figures, standing in until enough reads are ' +
+                'recorded to report real ones.') + '</p>' +
         '</div>' +
       '</div>' +
 
@@ -5913,10 +6389,12 @@ function toggleWrap(force){
     clearTimeout(WRAP.timer);
     el.classList.remove('is-open');
     el.setAttribute('aria-hidden', 'true');
-    dwellResume();
+    dwellResume('wrap');
     return;
   }
-  dwellPause();
+  dwellPause('wrap');
+  REC.wrapOpened = true;
+  recEvent('wrap_opened');
   WRAP.cards = wrapCards();
   WRAP.i = 0;
   el.setAttribute('aria-hidden', 'false');
@@ -5924,6 +6402,20 @@ function toggleWrap(force){
   requestAnimationFrame(function(){
     el.classList.add('is-open');
     wrapGo(0);
+  });
+
+  /* Ask for the benchmark again on the way in. Sign-in already warmed it, so
+     this is usually a no-op against a cached response — but if it does land
+     while the earlier cards are still playing, rebuild and redraw, since the
+     summary is last and there is normally time. Guarded on the panel still
+     being open and on the summary being what is on screen, so a reader who
+     closed it or clicked ahead does not get a card yanked out from under
+     them. */
+  recStats().then(function(){
+    if(!benchIsReal() || !el.classList.contains('is-open')) return;
+    WRAP.cards = wrapCards();
+    var card = WRAP.cards[WRAP.i];
+    if(card && card.layout === 'summary') renderWrapCard();
   });
 }
 
@@ -6363,12 +6855,20 @@ var bypass = q.get('skipgate') === '1' || q.get('slide') || location.hash;
 var REAL_TITLE = 'Nateland Experiences \u2014 Investor Presentation';
 afterDoor = function(){
   document.title = REAL_TITLE;
-  if(returning){ go(start, true); dwellEnter(start); }
+  if(returning){
+    go(start, true); dwellEnter(start);
+    /* The card is only shown once, so this is the only thing that counts a
+       second visit. It is the same idempotent upsert as the first sign-in. */
+    recSignIn(true);
+  }
   else openGate();
 };
 if(bypass){
   document.title = REAL_TITLE;
   go(start, true); dwellEnter(start);
+  /* ?slide=, a hash link or ?skipgate=1 — our own way in, and no identity to
+     record unless this browser already had one. */
+  if(returning) recSignIn(true);
 } else if(!doorPassed()){
   openDoor();
 } else {
@@ -6450,6 +6950,15 @@ window.Deck = {
   diag: toggleDiag, breakout: toggleBreakout, model: MODEL,
   save: saveEditedCopy, wrapped: toggleWrap, wrapGo: function(n){ wrapGo(n); return WRAP.i; },
   session: SESSION,
+  /* The reader record. Deck.record('asked_about_capex') logs a milestone
+     against this read — the events table takes any kind, so anything worth
+     asking about later can be marked from here without a schema change.
+     Deck.sync() sends now instead of waiting for the debounce, and returns
+     the transport's state, which is where to look first if nothing is
+     arriving: base null means it decided not to use the network at all. */
+  record: recEvent,
+  sync: function(){ recFlush(false); return REC; },
+  benchmark: function(){ return { real: benchIsReal(), data: benchData() }; },
   mapCalibrate: toggleMapCal, mapHighlight: toggleMapHighlight,
   mapRegions: function(r){ if(r){ for(var k in r) MAP_REGIONS[k]=r[k];
     paintMapShapes(); } return MAP_REGIONS; },

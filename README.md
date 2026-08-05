@@ -32,3 +32,20 @@ embedded as base64 WebP, so it survives being emailed or dropped into a data roo
 
 Editing notes (palette, slide markup, chart data) are in the comment block at the
 top of the HTML file itself.
+
+## The reader record
+
+The hosted copy keeps what the sign-in card collects, and how long each reader
+spent on each slide, in Postgres — which is also where the read-back's "across
+all readers" column gets its figures. Opened from a file or an email attachment
+the deck does not reach for the network at all, and behaves exactly as described
+above.
+
+Setup, the endpoints, how to get the data out, and what the reader is told about
+it: [`DATABASE.md`](DATABASE.md).
+
+```bash
+npm install && npm run migrate    # create the tables
+npm run dev                       # deck + API locally, nothing to set up
+npm run report                    # who has read it
+```

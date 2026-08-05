@@ -10,6 +10,11 @@
       ]
     }
   ],
+  "functions": {
+    "api/*.js": {
+      "maxDuration": 10
+    }
+  },
   "rewrites": [
     { "source": "/", "destination": "/nateland-investor-deck-EXTERNAL.html" }
   ]
