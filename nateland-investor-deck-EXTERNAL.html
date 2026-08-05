@@ -3502,6 +3502,23 @@ function chartNiceStep(max){
     if(Math.ceil(max / steps[i]) <= 6) return steps[i];
   return 2000;
 }
+/* The step the gridline labels actually use. It prefers a step that divides
+   the maximum exactly, so an authored ceiling is labelled all the way to the
+   top: 350 reads 0-350 in 50s, where chartNiceStep would have chosen 100s and
+   left the top line bare. There is room for seven intervals because CH.GRID is
+   eight lines, one more than chartNiceStep is willing to fill.
+
+   Falls back to chartNiceStep for a maximum that no round step divides, which
+   is what an axis expanded to fit the data gets. */
+function chartAxisStep(max){
+  var steps = [5,10,20,25,50,100,200,250,500,1000,2000];
+  var room = CH.GRID - 1;
+  for(var i=0;i<steps.length;i++){
+    var n = max / steps[i];
+    if(n <= room && Math.abs(n - Math.round(n)) < 1e-9) return steps[i];
+  }
+  return chartNiceStep(max);
+}
 function chartPeak(){
   return CHART.reduce(function(m,d){ return Math.max(m, d.cost + d.ebitda); }, 0);
 }
@@ -3576,7 +3593,7 @@ function paintChart(st){
 
   /* labels come from the settled target so the numbers stay round, while
      their positions follow the interpolated scale and therefore glide */
-  var step = chartNiceStep(CH.tgt ? CH.tgt.max : st.max);
+  var step = chartAxisStep(CH.tgt ? CH.tgt.max : st.max);
   els.grid.forEach(function(gl, i){
     var v = i * step;
     var yy = y(v);
@@ -3602,26 +3619,45 @@ function paintChart(st){
   });
 }
 
-/* The axis holds a floor of $200M rather than hugging the data.
+/* The axis holds a floor of $350M rather than hugging the data.
 
    An axis that rescales to fit hides the thing the levers are for: double the
    attendance and the bars stay exactly the same height while only the labels
-   change, so growth becomes invisible. Against a fixed ceiling the base case
-   sits at 59% of the frame and every improvement climbs into the space above
-   it — which is also the argument slide 22 is making, that these are the
-   study's figures and the levers that would move them are excluded rather
-   than exhausted.
+   change, so growth becomes invisible. Against a fixed ceiling every
+   improvement climbs into the space above the base case — which is also the
+   argument slide 22 is making, that these are the study's figures and the
+   levers that would move them are excluded rather than exhausted.
 
-   It is a floor, not a cap: the levers can reach $345M at full stretch, so
-   above $200M the axis expands and glides rather than clipping a bar. */
-var CHART_AXIS_FLOOR = 200;
+   At 350 the frame holds still across everything a lever is likely to be
+   pulled to. The base case peaks at $117.5M and so sits at a third of the
+   frame — that is the trade, and it is the right way round: the case being
+   presented is not flattered by an axis that shrinks to fit it, and every
+   improvement reads as height rather than as a relabelled gridline.
+
+   It is a floor and not a cap. Every lever at its most expansive at once
+   peaks at about $345M, which needs $365M with the label headroom below, so
+   that one combination alone expands the axis to 400 rather than clipping a
+   bar. Reaching it takes 3M visits, a $125 gate, no price response, 2% real
+   growth and the year-five attraction, together. */
+var CHART_AXIS_FLOOR = 350;
 
 function chartTargetState(){
   var peak = chartPeak();
-  var need = Math.max(CHART_AXIS_FLOOR, peak * 1.06);
-  var step = chartNiceStep(need);
+  /* 6% of headroom, because the total sits in a label 8px above the bar and a
+     bar at the ceiling puts that label off the top of the frame. */
+  var need = peak * 1.06;
+
+  /* Below the floor, the floor is the axis exactly as written. Rounding it up
+     to a nice step would put a different ceiling on screen than the one set
+     above, which is a poor way to treat an authored number. Only an overshoot
+     falls back to rounding. */
+  var max = CHART_AXIS_FLOOR;
+  if(need > CHART_AXIS_FLOOR){
+    var step = chartNiceStep(need);
+    max = Math.ceil(need / step) * step;
+  }
   return {
-    max: Math.ceil(need / step) * step,
+    max: max,
     bars: CHART.map(function(d){ return { cost:d.cost, ebitda:d.ebitda }; })
   };
 }
@@ -4280,10 +4316,26 @@ var DRIVERS_BASE = JSON.parse(JSON.stringify(DRIVERS));
 var SITE = 'Davidson';       /* the deck's case; Rutherford is slide 20    */
 
 /* ---- the chain ---- */
+/* How much of the set attendance survives the gate price. One definition,
+   because the lever pane shows this and the projection applies it, and the two
+   disagreeing would be worse than either being wrong.
+
+   It is 1 at the reference gate whatever the elasticity is set to, which is
+   the honest answer and worth knowing when reading the pane: at $85, None,
+   Moderate and Cautious are the same case. The setting only bites once the
+   price moves off the study's own assumption. */
+function planPriceFactor(){
+  return 1 + DRIVERS.elasticity * (DRIVERS.gate / PLAN.refGate - 1);
+}
+
+/* Stabilised visits after the price response — year 3, before growth. */
+function planEffectiveVisits(){
+  return DRIVERS.visits * planPriceFactor();
+}
+
 function planYears(){
   var P = PLAN, D = DRIVERS;
-  var priceFactor = 1 + D.elasticity * (D.gate / P.refGate - 1);
-  var stab = D.visits * priceFactor;
+  var stab = planEffectiveVisits();
   var pc = P.perCap[SITE], yld = P.yieldOf[SITE];
   var opexStab = P.opexSet[D.costSet] !== undefined
     ? P.opexSet[D.costSet] : P.opexSet['Robinett'];
@@ -4401,7 +4453,9 @@ var LEVER_GROUPS = [
       { kind:'range', k:'visits', label:'Stabilised visits',
         min:1000, max:3000, step:10, dec:0, fmt:'visits',
         note:'The study\'s medium case is 1.50M. Past about 2M the rest of the ' +
-             'model stops keeping up.' }
+             'model stops keeping up. A second figure appears here when the ' +
+             'gate price is away from $85 — that is where attendance actually ' +
+             'lands once the effect below is applied.' }
     ] },
 
   { title:'Gate price',
@@ -4412,7 +4466,9 @@ var LEVER_GROUPS = [
       { kind:'choice', k:'elasticity', label:'Effect on attendance',
         options:[0, -0.4, -0.6],
         labels:['None','Moderate','Cautious'],
-        note:'Whether charging more costs you visitors.' }
+        note:'Whether charging more costs you visitors. Moderate and Cautious ' +
+             'move the stabilised visits figure above; at $85 all three agree, ' +
+             'because there is no price move to answer.' }
     ] },
 
   { title:'Operating costs',
@@ -4439,11 +4495,40 @@ var LEVER_GROUPS = [
     ] }
 ];
 
-/* 1502 reads as 1.50M visits, not as a bare number. */
+/* 1502 reads as 1.50M visits, not as a bare number.
+
+   The visits lever reads out twice when the price response is doing something:
+   what was set, then where it lands after the gate and the elasticity have had
+   their say. The response has always been in the projection — slide 22's own
+   headline figure has shown the reduced number all along — but the lever sat
+   at 1.50M regardless, so picking Cautious looked like it did nothing.
+
+   Only the readout is derived. DRIVERS.visits stays the number the slider was
+   put at, and the response is applied once, in planEffectiveVisits(). Writing
+   the result back into the driver would have the projection apply it a second
+   time on the next pass. */
 function leverText(c){
   var v = DRIVERS[c.k];
-  if(c.fmt === 'visits') return (v / 1000).toFixed(2) + 'M';
+  if(c.fmt === 'visits'){
+    var set = (v / 1000).toFixed(2) + 'M';
+    var eff = planEffectiveVisits();
+    /* Under a thousand visits apart is under 0.01M and would print as the same
+       figure twice, which reads as a bug rather than as agreement. */
+    if(Math.abs(eff - v) < 1) return set;
+    return set + ' → ' + (eff / 1000).toFixed(2) + 'M';
+  }
   return (c.prefix || '') + v.toFixed(c.dec) + (c.suffix || '');
+}
+
+/* Repaint every readout in place. The gate slider moves the visits figure two
+   rows above it, so a slider cannot only update itself — and it cannot rebuild
+   the pane either, because that would replace the element being dragged. */
+function refreshLeverReadouts(){
+  var host = $('#edDrivers');
+  if(!host) return;
+  $$('.ed-row', host).forEach(function(row){
+    if(row._lever && row._out) row._out.textContent = leverText(row._lever);
+  });
 }
 
 function buildDriverPane(){
@@ -4488,11 +4573,12 @@ function buildDriverPane(){
             '" step="' + c.step + '" value="' + DRIVERS[c.k] + '">' +
           (c.note ? '<p class="sc">' + c.note + '</p>' : '');
         var rng = row.querySelector('input'), out = row.querySelector('b');
+        row._lever = c; row._out = out;
         rng.addEventListener('input', function(){
           DRIVERS[c.k] = parseFloat(rng.value);
-          out.textContent = leverText(c);
           markDriverDirty();
           projectFromDrivers();
+          refreshLeverReadouts();
         });
       }
       host.appendChild(row);
