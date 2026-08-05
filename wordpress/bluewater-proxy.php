@@ -24,6 +24,27 @@
  * purges it. A deck is not a blog post; it changes the hour before a meeting.
  *
  * So this asks, in every dialect the stack speaks, not to be cached.
+ *
+ * TWO THINGS THIS CANNOT DO BY ITSELF
+ *
+ * 1. It does not purge what is already cached. It stops future stores. The
+ *    object WP Engine is holding stays until it is purged or its TTL lapses,
+ *    so deploying this without a purge looks exactly like it did not work.
+ *    Purge from the User Portal, or from WP Admin under WP Engine.
+ *
+ * 2. WP Engine does not promise to honour it. Their documentation says the
+ *    page cache TTL is 600s and that "cache-control headers for pages set
+ *    lower than 600 will not be effective", with a full page cache exclusion
+ *    available only through their support. Varnish's builtin VCL does pass on
+ *    no-cache/no-store/private, so this may well be enough — but it is
+ *    undocumented, so verify rather than assume: after a purge, request the
+ *    path twice and read X-Cache. A second request answering HIT means this
+ *    is not working, and the fix is a support ticket for a cache exclusion on
+ *    /bluewater, or a cache-bypass rule in their Web Rules engine.
+ *
+ * Until one of those is in place, a redeploy can be forced through by sending
+ * a single request with a `Cache-Control: no-cache` header, which makes the
+ * edge revalidate against Vercel and replace what it is holding.
  */
 
 if (!defined('ABSPATH')) {
@@ -44,8 +65,12 @@ function bluewater_maybe_proxy() {
     $rest  = isset($m['rest']) ? ltrim($m['rest'], '/') : '';
     $query = isset($m['query']) ? $m['query'] : '';
 
-    // Understood by W3 Total Cache, WP Rocket, LiteSpeed, Batcache and WP
-    // Engine's own layer. Set before any output, which `plugins_loaded` is.
+    // A free bet on the PHP-level caches, not the load-bearing part. This
+    // constant is an advanced-cache.php drop-in convention — W3 Total Cache,
+    // WP Rocket, LiteSpeed, Batcache all read it. WP Engine's page cache is
+    // edge Varnish/nginx and does not document reading it, so do not rely on
+    // this alone; the Cache-Control header further down is what should stop
+    // them. Harmless either way, and correct if a drop-in is ever added.
     if (!defined('DONOTCACHEPAGE')) {
         define('DONOTCACHEPAGE', true);
     }
@@ -57,15 +82,28 @@ function bluewater_maybe_proxy() {
     ));
     if (is_wp_error($resp)) {
         // A failure must not be cached either, or one bad minute at the origin
-        // becomes ten minutes of an error page where the deck should be.
-        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        // becomes ten minutes of an error page where the deck should be. Same
+        // directives as the success path, deliberately.
+        header('Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0');
         header('Content-Type: text/plain; charset=utf-8', true, 502);
         echo 'The presentation is temporarily unavailable. Please try again shortly.';
         exit;
     }
 
-    http_response_code((int) wp_remote_retrieve_response_code($resp));
-    foreach (array('content-type', 'x-robots-tag') as $name) {
+    // A response that is not a WP_Error can still carry no usable status, and
+    // `(int) ''` is 0 — an invalid code that php-fpm surfaces as a 500. Treat
+    // anything outside the valid range as what it actually is: a bad gateway.
+    $code = (int) wp_remote_retrieve_response_code($resp);
+    if ($code < 100 || $code > 599) {
+        $code = 502;
+    }
+    http_response_code($code);
+
+    // `location` is in this list because the status above is forwarded
+    // verbatim. Without it, a 3xx from the origin — say `redirection` was
+    // exhausted — would reach the browser as a redirect with nowhere to go,
+    // which renders as a blank page rather than as an error.
+    foreach (array('content-type', 'x-robots-tag', 'location') as $name) {
         $value = wp_remote_retrieve_header($resp, $name);
         if ($value) {
             header($name . ': ' . (is_array($value) ? implode(', ', $value) : $value));
