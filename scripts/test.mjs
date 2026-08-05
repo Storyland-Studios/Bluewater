@@ -704,6 +704,121 @@ await test('deleting a viewer takes their reads, slides and events with them', a
   equal(events.rows[0].n, 0, 'events gone');
 });
 
+console.log('\nfinding the connection string\n');
+
+/* loadEnv's rules are subtle enough to get wrong — process.loadEnvFile fills
+   gaps but never overwrites, so the file order has to be reversed to produce
+   the precedence everyone expects. These run against a temp directory and
+   never touch the repo's own env files. */
+{
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const os = await import('node:os');
+  const lib = await import('./_lib.mjs');
+
+  const KEYS = ['DATABASE_URL', 'DATABASE_URL_UNPOOLED', 'ADMIN_TOKEN'];
+  const saved = Object.fromEntries(KEYS.map(k => [k, process.env[k]]));
+  const restore = () => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  };
+
+  const dir = (files) => {
+    const d = mkdtempSync(path.join(os.tmpdir(), 'bw-env-'));
+    for (const [name, body] of Object.entries(files)) writeFileSync(path.join(d, name), body);
+    return d;
+  };
+  const clear = () => { for (const k of KEYS) delete process.env[k]; };
+
+  await test('reads .env', () => {
+    clear();
+    lib.loadEnv(dir({ '.env': 'DATABASE_URL="postgres://from-env/db"\n' }));
+    equal(lib.connectionString(), 'postgres://from-env/db');
+  });
+
+  await test('reads .env.local, which is what `vercel env pull` writes', () => {
+    clear();
+    lib.loadEnv(dir({ '.env.local': 'DATABASE_URL="postgres://from-local/db"\n' }));
+    equal(lib.connectionString(), 'postgres://from-local/db');
+  });
+
+  await test('.env.local beats .env', () => {
+    clear();
+    lib.loadEnv(dir({
+      '.env':       'DATABASE_URL="postgres://from-env/db"\n',
+      '.env.local': 'DATABASE_URL="postgres://from-local/db"\n'
+    }));
+    equal(lib.connectionString(), 'postgres://from-local/db');
+  });
+
+  await test('a real shell variable beats both files', () => {
+    clear();
+    process.env.DATABASE_URL = 'postgres://from-shell/db';
+    lib.loadEnv(dir({
+      '.env':       'DATABASE_URL="postgres://from-env/db"\n',
+      '.env.local': 'DATABASE_URL="postgres://from-local/db"\n'
+    }));
+    equal(lib.connectionString(), 'postgres://from-shell/db');
+  });
+
+  await test('a BLANK shell variable does not shadow the files', () => {
+    /* The one that actually bit. An empty variable still counts as set, so
+       loadEnvFile refused to fill it and every script reported the connection
+       string missing while it sat in .env.local. */
+    clear();
+    process.env.DATABASE_URL = '';
+    lib.loadEnv(dir({ '.env.local': 'DATABASE_URL="postgres://from-local/db"\n' }));
+    equal(lib.connectionString(), 'postgres://from-local/db');
+  });
+
+  await test('whitespace counts as blank too', () => {
+    clear();
+    process.env.DATABASE_URL = '   ';
+    lib.loadEnv(dir({ '.env': 'DATABASE_URL="postgres://from-env/db"\n' }));
+    equal(lib.connectionString(), 'postgres://from-env/db');
+  });
+
+  await test('migrations prefer the direct string over the pooled one', () => {
+    clear();
+    process.env.DATABASE_URL = 'postgres://pooled/db';
+    process.env.DATABASE_URL_UNPOOLED = 'postgres://direct/db';
+    equal(lib.connectionString({ preferDirect: true }), 'postgres://direct/db');
+    equal(lib.connectionString({ preferDirect: false }), 'postgres://pooled/db');
+  });
+
+  await test('falls back to the direct string when only it is set', () => {
+    clear();
+    process.env.DATABASE_URL_UNPOOLED = 'postgres://direct/db';
+    equal(lib.connectionString({ preferDirect: false }), 'postgres://direct/db');
+  });
+
+  await test('missing files are not an error', () => {
+    clear();
+    const loaded = lib.loadEnv(dir({}));
+    equal(loaded.length, 0);
+    equal(lib.connectionString(), '');
+  });
+
+  await test('TLS is verified for a remote host and off for a local socket', () => {
+    equal(lib.sslFor('postgres://u:p@db.neon.tech/x?sslmode=require').rejectUnauthorized, true);
+    equal(lib.sslFor('postgres://u:p@127.0.0.1:5432/x'), false);
+    equal(lib.sslFor('postgres://u:p@localhost:5432/x'), false);
+    equal(lib.sslFor('postgres://u:p@db.example.com/x?sslmode=disable'), false);
+  });
+
+  await test('PGSSL_NO_VERIFY downgrades verification, but only when asked', () => {
+    const before = process.env.PGSSL_NO_VERIFY;
+    process.env.PGSSL_NO_VERIFY = '1';
+    equal(lib.sslFor('postgres://u:p@db.example.com/x').rejectUnauthorized, false);
+    delete process.env.PGSSL_NO_VERIFY;
+    equal(lib.sslFor('postgres://u:p@db.example.com/x').rejectUnauthorized, true);
+    if (before !== undefined) process.env.PGSSL_NO_VERIFY = before;
+  });
+
+  restore();
+}
+
 /* ---- down ---------------------------------------------------------- */
 await admin.end().catch(() => {});
 await dbLib.pool().end().catch(() => {});

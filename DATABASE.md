@@ -11,14 +11,26 @@ a particular Postgres — anything you can reach with a connection string works.
 
 ## Set it up
 
-**1. A database.** Any Postgres. From the Vercel dashboard, Storage → Create →
-Neon is the shortest path and sets `DATABASE_URL` on the project for you.
-Supabase, Railway, RDS or a local Postgres are all fine; you just set the
-variable yourself.
+**1. A database.** Any Postgres. In the Vercel dashboard: **Storage → Create
+Database → Neon**. That is the shortest path because it sets `DATABASE_URL` on
+the project for you, on all three environments. Supabase, Railway, RDS or a
+local Postgres are all fine too; you just add the variable yourself under
+Settings → Environment Variables.
 
-**2. Environment variables.** Copy `.env.example` to `.env` for local work, and
-set the same values on Vercel under Settings → Environment Variables. Only
-`DATABASE_URL` is required — see the file for what the optional ones do.
+This step needs someone signed in to the Vercel account. Nothing else does.
+
+**2. Get the connection string onto this machine.**
+
+```bash
+npx vercel login && npx vercel link && npx vercel env pull
+```
+
+`env pull` writes `.env.local`, which every script here reads. That file is
+gitignored and holds a live credential — treat it accordingly.
+
+Prefer not to install the CLI? Copy `.env.example` to `.env` and paste the
+string in by hand. Either file works; `.env.local` wins if both define the same
+key, and a variable already set in your shell beats both.
 
 **3. Create the tables.**
 
@@ -29,9 +41,18 @@ npm install && npm run migrate
 Idempotent, so it is safe to run against a live database and safe to run twice.
 If your provider gives both a pooled and a direct connection string, put the
 direct one in `DATABASE_URL_UNPOOLED` — a pooler in transaction mode can refuse
-a multi-statement script.
+a multi-statement script. Neon and Vercel Postgres both set that variable
+themselves, so `env pull` picks it up.
 
-**4. Deploy.** `git push`, or `vercel --prod`.
+**4. Redeploy.** Environment variables only reach builds made after they were
+set, so a project that was already deployed needs one more:
+
+```bash
+npx vercel --prod
+```
+
+Or just push a commit. Then check it: `curl https://bluewater-tau.vercel.app/api/stats`
+should answer `{"ok":true,"viewers":0,…}` rather than a 503.
 
 ## Check it works
 
@@ -40,9 +61,17 @@ curl https://bluewater-tau.vercel.app/api/stats
 ```
 
 `{"ok":true,"viewers":0,...}` means the deck and the database are talking.
-`503 DATABASE_URL is not set` means step 2 did not reach the deployment —
-environment variables only apply to builds made after they were set, so
-redeploy.
+
+`503 DATABASE_URL is not set` means the variable has not reached the running
+deployment. Either it was never set on the project, or it was set after the
+last build — redeploy and check again.
+
+**Until that 503 goes away, the deck is telling readers something untrue.** The
+sign-in card says their details are recorded, and with no database behind it
+nothing is. It fails safely — the gate closes, the deck presents normally, the
+read-back falls back to its labelled sample figures and there are no errors —
+but no reader is being recorded, so do not read an empty `npm run report` as
+"nobody has opened it".
 
 ## Get the data out
 

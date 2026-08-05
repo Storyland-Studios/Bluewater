@@ -18,32 +18,20 @@
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import pg from 'pg';
+import { loadEnv, connectionString, sslFor, noConnectionStringMessage } from './_lib.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+loadEnv(root);
 
-try { process.loadEnvFile(path.join(root, '.env')); }
-catch { /* variables expected in the environment instead */ }
-
-const url = process.env.DATABASE_URL_UNPOOLED || process.env.DATABASE_URL;
+const url = connectionString({ preferDirect: true });
 if (!url) {
-  console.error('DATABASE_URL is not set. See .env.example.');
+  console.error(noConnectionStringMessage());
   process.exit(1);
 }
 
 const args     = process.argv.slice(2);
 const wantCsv  = args.includes('--csv');
 const wantAll  = args.includes('--slides');
-
-function sslFor(connectionString) {
-  if (/[?&]sslmode=disable/.test(connectionString)) return false;
-  let host = '';
-  try { host = new URL(connectionString).hostname; } catch { /* assume remote */ }
-  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
-  if (/^(1|true|yes)$/i.test(process.env.PGSSL_NO_VERIFY ?? '')) {
-    return { rejectUnauthorized: false };
-  }
-  return { rejectUnauthorized: true };
-}
 
 const dur = ms => {
   const s = Math.round(Number(ms) / 1000);

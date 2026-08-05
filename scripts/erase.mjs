@@ -25,15 +25,14 @@
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import pg from 'pg';
+import { loadEnv, connectionString, sslFor, noConnectionStringMessage } from './_lib.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+loadEnv(root);
 
-try { process.loadEnvFile(path.join(root, '.env')); }
-catch { /* variables expected in the environment instead */ }
-
-const url = process.env.DATABASE_URL_UNPOOLED || process.env.DATABASE_URL;
+const url = connectionString({ preferDirect: true });
 if (!url) {
-  console.error('DATABASE_URL is not set. See .env.example.');
+  console.error(noConnectionStringMessage());
   process.exit(1);
 }
 
@@ -46,17 +45,6 @@ if (!email) {
   console.error('  npm run erase -- someone@example.com          # dry run');
   console.error('  npm run erase -- someone@example.com --yes    # do it\n');
   process.exit(1);
-}
-
-function sslFor(connectionString) {
-  if (/[?&]sslmode=disable/.test(connectionString)) return false;
-  let host = '';
-  try { host = new URL(connectionString).hostname; } catch { /* assume remote */ }
-  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
-  if (/^(1|true|yes)$/i.test(process.env.PGSSL_NO_VERIFY ?? '')) {
-    return { rejectUnauthorized: false };
-  }
-  return { rejectUnauthorized: true };
 }
 
 const client = new pg.Client({ connectionString: url, ssl: sslFor(url) });

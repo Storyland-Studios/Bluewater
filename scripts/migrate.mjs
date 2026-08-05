@@ -21,35 +21,16 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import pg from 'pg';
+import { loadEnv, connectionString, sslFor, noConnectionStringMessage } from './_lib.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+loadEnv(root);
 
-try { process.loadEnvFile(path.join(root, '.env')); }
-catch { /* no .env — the variables are expected to be in the environment */ }
-
-/* The pooled connection string is what the API should use; a pooler in
-   transaction mode can reject a multi-statement script like this one. Neon
-   and Vercel Postgres both expose the direct string as DATABASE_URL_UNPOOLED,
-   so prefer it when it is there. */
-const url = process.env.DATABASE_URL_UNPOOLED || process.env.DATABASE_URL;
+const url = connectionString({ preferDirect: true });
 
 if (!url) {
-  console.error('DATABASE_URL is not set.\n');
-  console.error('Copy .env.example to .env and put the connection string in it,');
-  console.error('or set it for one command:\n');
-  console.error('  DATABASE_URL="postgres://..." npm run migrate\n');
+  console.error(noConnectionStringMessage());
   process.exit(1);
-}
-
-function sslFor(connectionString) {
-  if (/[?&]sslmode=disable/.test(connectionString)) return false;
-  let host = '';
-  try { host = new URL(connectionString).hostname; } catch { /* assume remote */ }
-  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
-  if (/^(1|true|yes)$/i.test(process.env.PGSSL_NO_VERIFY ?? '')) {
-    return { rejectUnauthorized: false };
-  }
-  return { rejectUnauthorized: true };
 }
 
 const sql = await readFile(path.join(root, 'db', 'schema.sql'), 'utf8');
