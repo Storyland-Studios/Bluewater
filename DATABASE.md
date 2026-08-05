@@ -17,9 +17,30 @@ the project for you, on all three environments. Supabase, Railway, RDS or a
 local Postgres are all fine too; you just add the variable yourself under
 Settings → Environment Variables.
 
-This step needs someone signed in to the Vercel account. Nothing else does.
+### Who can do which step
 
-**2. Get the connection string onto this machine.**
+Worth settling before you start, because it is not only step 1 that needs the
+Vercel account — step 2 does too, and step 3 needs what step 2 produces. If the
+person who creates the database then walks away, whoever is left still cannot
+create the tables.
+
+So pick one of these:
+
+- **The account holder does all four.** They need a checkout of this repo and
+  `npm install`. Fewest handoffs, and the only option that needs no sharing.
+- **The account holder creates the database, then grants project access** to
+  whoever is doing the rest. Best if this will be maintained by more than one
+  person, which it will be.
+- **The account holder creates the database and shares the connection string**
+  — through a password manager, not chat or email. The other person puts it in
+  `.env` and picks up at step 3.
+
+Either way the database itself only has to be created once, and nothing after
+step 4 needs Vercel at all: `npm run report` and `npm run erase` talk to
+Postgres directly.
+
+**2. Get the connection string onto this machine.** Needs Vercel access, same
+as step 1.
 
 ```bash
 npx vercel login && npx vercel link && npx vercel env pull
