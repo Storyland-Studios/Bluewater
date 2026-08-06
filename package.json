@@ -12,6 +12,7 @@
     "test:api": "node scripts/test.mjs",
     "test:client": "node scripts/test-client.mjs",
     "lint:php": "node scripts/lint-php.mjs",
+    "map": "node scripts/embed-map.mjs",
     "migrate": "node scripts/migrate.mjs",
     "report": "node scripts/report.mjs",
     "dev": "node scripts/dev.mjs",
@@ -23,6 +24,7 @@
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
     "@electric-sql/pglite-socket": "^0.2.7",
-    "php-parser": "^3.7.0"
+    "php-parser": "^3.7.0",
+    "sharp": "^0.35.3"
   }
 }
