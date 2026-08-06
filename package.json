@@ -13,6 +13,7 @@
     "test:client": "node scripts/test-client.mjs",
     "lint:php": "node scripts/lint-php.mjs",
     "map": "node scripts/embed-map.mjs",
+    "thumbs": "node scripts/thumbs.mjs",
     "migrate": "node scripts/migrate.mjs",
     "report": "node scripts/report.mjs",
     "dev": "node scripts/dev.mjs",
