@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bluewater Proxy
  * Description: Serves /bluewater from the Bluewater Vercel deployment without changing the URL.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: Storyland Studios
  */
 
@@ -23,7 +23,19 @@
  * nothing in WordPress knows when the deck is redeployed and so nothing ever
  * purges it. A deck is not a blog post; it changes the hour before a meeting.
  *
- * So this asks, in every dialect the stack speaks, not to be cached.
+ * So this asks not to be stored by anything shared, and asks the browser to
+ * check with the origin before reusing what it has.
+ *
+ * THE BROWSER IS ALLOWED TO KEEP A COPY, AND SHOULD
+ *
+ * An earlier version of this sent `no-store`, which forbids that. Correct
+ * about staleness, expensive about everything else: the deck is 5.4MB, so
+ * every view — including pressing Back — refetched all of it through
+ * php-fpm. `no-cache` is the directive that was wanted. The browser keeps
+ * its copy and must revalidate before reusing it, so the answer is a 304 of
+ * a few hundred bytes when nothing has changed and the full document the
+ * moment it has. Conditional headers are forwarded in both directions below
+ * to make that work.
  *
  * TWO THINGS THIS CANNOT DO BY ITSELF
  *
@@ -75,10 +87,23 @@ function bluewater_maybe_proxy() {
         define('DONOTCACHEPAGE', true);
     }
 
+    // Pass the browser's validators upstream so Vercel can answer 304. The deck
+    // is 5.4MB and nothing caches it any more, so without this every single
+    // view refetches the whole thing through php-fpm. With it, a repeat view
+    // costs a couple of hundred bytes and is still never stale.
+    $forward = array();
+    if (!empty($_SERVER['HTTP_IF_NONE_MATCH'])) {
+        $forward['If-None-Match'] = wp_unslash($_SERVER['HTTP_IF_NONE_MATCH']);
+    }
+    if (!empty($_SERVER['HTTP_IF_MODIFIED_SINCE'])) {
+        $forward['If-Modified-Since'] = wp_unslash($_SERVER['HTTP_IF_MODIFIED_SINCE']);
+    }
+
     $resp = wp_remote_get(BLUEWATER_ORIGIN . '/' . $rest . $query, array(
         'timeout'     => 30,
         'redirection' => 3,
         'user-agent'  => 'storylandstudios-bluewater-proxy',
+        'headers'     => $forward,
     ));
     if (is_wp_error($resp)) {
         // A failure must not be cached either, or one bad minute at the origin
@@ -103,21 +128,35 @@ function bluewater_maybe_proxy() {
     // verbatim. Without it, a 3xx from the origin — say `redirection` was
     // exhausted — would reach the browser as a redirect with nowhere to go,
     // which renders as a blank page rather than as an error.
-    foreach (array('content-type', 'x-robots-tag', 'location') as $name) {
+    //
+    // `etag` and `last-modified` are here so the browser has something to
+    // revalidate with next time. The body this proxy sends is byte-for-byte
+    // the origin's, so the origin's validators describe it accurately.
+    foreach (array('content-type', 'x-robots-tag', 'location', 'etag', 'last-modified') as $name) {
         $value = wp_remote_retrieve_header($resp, $name);
         if ($value) {
             header($name . ': ' . (is_array($value) ? implode(', ', $value) : $value));
         }
     }
-    // `private` is the one that most reverse-proxy caches, WP Engine's
-    // included, treat as "not yours to store". The rest are for older
-    // intermediaries and for the browser.
-    header('Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0');
-    header('Pragma: no-cache');
+
+    // `private` keeps shared caches — WP Engine's Varnish included — from
+    // storing it, which is the whole reason this plugin was changed.
+    //
+    // `no-cache` rather than `no-store`, and the distinction is the point:
+    // no-store forbids the browser from keeping a copy at all, which makes
+    // the ETag above useless and costs a fresh 5.4MB on every view. no-cache
+    // lets the browser keep it and requires it to revalidate before reuse —
+    // never stale, but a repeat view is a 304 instead of a download.
+    header('Cache-Control: private, no-cache, must-revalidate, max-age=0');
     header('Expires: 0');
-    if ($method !== 'HEAD') {
-        echo wp_remote_retrieve_body($resp); // phpcs:ignore WordPress.Security.EscapeOutput -- proxied document
+
+    // 304 carries no body, by definition. Sending one anyway is the classic way
+    // to make a conditional request look like a corrupt page.
+    if ($code === 304 || $method === 'HEAD') {
+        exit;
     }
+
+    echo wp_remote_retrieve_body($resp); // phpcs:ignore WordPress.Security.EscapeOutput -- proxied document
     exit;
 }
 add_action('plugins_loaded', 'bluewater_maybe_proxy');
