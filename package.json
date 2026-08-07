@@ -17,7 +17,8 @@
     "migrate": "node scripts/migrate.mjs",
     "report": "node scripts/report.mjs",
     "dev": "node scripts/dev.mjs",
-    "dev:vercel": "vercel dev"
+    "dev:vercel": "vercel dev",
+    "headshots": "node scripts/headshots.mjs"
   },
   "dependencies": {
     "pg": "^8.22.0"
