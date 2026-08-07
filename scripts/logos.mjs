@@ -31,8 +31,8 @@ const MARKS = [
   { file: 'warner.png',    label: 'Warner Bros.' },
   /* LEGO is the exception. Its mark is a red square with the name knocked
      out of it and no transparent margin at all — mean alpha 255 across the
-     whole file — so flattening it fills the square solid. It keeps its own
-     colour instead. */
+     whole file — so flattening it fills the square solid. Its letters are
+     recovered by luminance instead; see below. */
   { file: 'lego.png',      label: 'LEGO', lettersOnly: true },
   { file: 'aecom.png',     label: 'AECOM' },
   { file: 'merlin.png',    label: 'Merlin Entertainments' }
@@ -50,15 +50,36 @@ for (const m of MARKS) {
      colour it is the one bright block in a grey row. The letters are the only
      light pixels in the file, so luminance separates them: threshold it, and
      use the result as an alpha channel over white. What is left is the
-     wordmark on transparency, which takes the same treatment as the rest. */
+     wordmark on transparency, which takes the same treatment as the rest.
+
+     The letters are then cut to their own bounds. Without this they keep the
+     square's footprint, and since everything is normalised to one HEIGHT the
+     square's empty top and bottom would push the letters down to about half
+     the size of every other mark in the row. sharp's own trim() will not do
+     it — it compares against the corner pixel and this mask has none of the
+     uniform border it looks for — so the bounds are read off the mask. */
   const src = m.lettersOnly
     ? await (async () => {
         const img = sharp(p).flatten({ background: "#000" });
         const { width, height } = await img.metadata();
         const mask = await img.clone().greyscale().threshold(150).toColourspace("b-w").raw().toBuffer();
-        return sharp({ create: { width, height, channels: 3, background: "#ffffff" } })
+
+        let x0 = width, y0 = height, x1 = -1, y1 = -1;
+        for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+          if (mask[y * width + x] < 128) continue;
+          if (x < x0) x0 = x; if (x > x1) x1 = x;
+          if (y < y0) y0 = y; if (y > y1) y1 = y;
+        }
+        if (x1 < 0) throw new Error(`${m.file}: nothing above the threshold`);
+
+        /* Two passes: extract is ignored on a create() pipeline, so the
+           white-plus-mask image has to exist before it can be cut. */
+        const full = await sharp({ create: { width, height, channels: 3, background: "#ffffff" } })
           .joinChannel(mask, { raw: { width, height, channels: 1 } })
-          .png().trim().toBuffer();   /* the square left empty margin round the letters */
+          .png().toBuffer();
+        return sharp(full)
+          .extract({ left: x0, top: y0, width: x1 - x0 + 1, height: y1 - y0 + 1 })
+          .png().toBuffer();
       })()
     : p;
 
