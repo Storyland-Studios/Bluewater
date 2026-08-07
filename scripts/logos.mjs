@@ -29,12 +29,13 @@ const MARKS = [
   { file: 'disney.png',    label: 'Disney' },
   { file: 'universal.png', label: 'Universal' },
   { file: 'warner.png',    label: 'Warner Bros.' },
-  /* LEGO's mark is a red square with the name knocked out of it, so
-     flattening it to one colour fills the square solid. A wordmark says the
-     same thing and survives the treatment. */
-  { file: null,            label: 'LEGO' },
+  /* LEGO is the exception. Its mark is a red square with the name knocked
+     out of it and no transparent margin at all — mean alpha 255 across the
+     whole file — so flattening it fills the square solid. It keeps its own
+     colour instead. */
+  { file: 'lego.png',      label: 'LEGO', lettersOnly: true },
   { file: 'aecom.png',     label: 'AECOM' },
-  { file: null,            label: 'Merlin Entertainments' }
+  { file: 'merlin.png',    label: 'Merlin Entertainments' }
 ];
 
 let deck = readFileSync(DECK, 'utf8');
@@ -44,11 +45,29 @@ for (const m of MARKS) {
   if (!m.file) { cells.push(`<span class="lg-word">${m.label}</span>`); continue; }
   const p = path.join(SRC, m.file);
   if (!existsSync(p)) { console.log(`  missing: ${m.file}`); continue; }
-  const buf = await sharp(p)
+  /* LEGO arrives as white letters knocked out of a solid red square with no
+     transparency anywhere, so it cannot be flattened like the others and in
+     colour it is the one bright block in a grey row. The letters are the only
+     light pixels in the file, so luminance separates them: threshold it, and
+     use the result as an alpha channel over white. What is left is the
+     wordmark on transparency, which takes the same treatment as the rest. */
+  const src = m.lettersOnly
+    ? await (async () => {
+        const img = sharp(p).flatten({ background: "#000" });
+        const { width, height } = await img.metadata();
+        const mask = await img.clone().greyscale().threshold(150).toColourspace("b-w").raw().toBuffer();
+        return sharp({ create: { width, height, channels: 3, background: "#ffffff" } })
+          .joinChannel(mask, { raw: { width, height, channels: 1 } })
+          .png().trim().toBuffer();   /* the square left empty margin round the letters */
+      })()
+    : p;
+
+  const buf = await sharp(src)
     .resize({ height: H, fit: 'inside', withoutEnlargement: false })
     .webp({ quality: 90, alphaQuality: 100 })
     .toBuffer();
-  cells.push(`<img src="data:image/webp;base64,${buf.toString('base64')}" alt="${m.label}">`);
+  cells.push(`<img ` +
+    `src="data:image/webp;base64,${buf.toString('base64')}" alt="${m.label}">`);
   console.log(`  ${m.label.padEnd(22)} ${(buf.length / 1024).toFixed(1)} KB`);
 }
 
