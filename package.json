@@ -18,7 +18,8 @@
     "report": "node scripts/report.mjs",
     "dev": "node scripts/dev.mjs",
     "dev:vercel": "vercel dev",
-    "headshots": "node scripts/headshots.mjs"
+    "headshots": "node scripts/headshots.mjs",
+    "logos": "node scripts/logos.mjs"
   },
   "dependencies": {
     "pg": "^8.22.0"
