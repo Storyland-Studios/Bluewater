@@ -30,16 +30,19 @@ const args = process.argv.slice(2);
 const flag = n => { const i = args.indexOf(n); return i < 0 ? null : (args[i + 1] || ''); };
 const FROM = flag('--from') || path.join(process.env.USERPROFILE || '', 'Downloads');
 
-/* 44px on the slide, so 96 keeps it sharp on a retina panel and at the
+/* 154px on the slide, so 320 keeps it sharp on a retina panel and at the
    1600-wide capture the thumbnail generator takes. */
-const PX = 96, QUALITY = 82;
+const PX = 320, QUALITY = 82;
 
 let deck = readFileSync(DECK, 'utf8');
 
-/* Everyone on the slide, in document order, with what to look for. */
+/* Everyone on the slide, in document order. The box holds initials on a first
+   run and a portrait on any later one, so this matches either — otherwise the
+   script would only ever work once and changing the size would mean starting
+   from a clean checkout. */
 const members = [...deck.matchAll(
-  /<div class="av">([^<]*)<\/div><div class="nm">([^<]*)<\/div>/g)]
-  .map(m => ({ initials: m[1], name: m[2].replace(/&amp;/g, '&') }));
+  /<div class="av">([\s\S]*?)<\/div><div class="nm">([^<]*)<\/div>/g)]
+  .map(m => ({ inner: m[1], name: m[2].replace(/&amp;/g, '&') }));
 
 if (!members.length) { console.error('No team members found in the deck.'); process.exit(1); }
 if (!existsSync(FROM)) { console.error(`No such folder: ${FROM}`); process.exit(1); }
@@ -63,7 +66,7 @@ let done = 0;
 const report = [];
 for (const m of members) {
   const file = findFile(m.name);
-  if (!file) { report.push([m.name, m.initials, 'no photograph — kept initials']); continue; }
+  if (!file) { report.push([m.name, '—', 'no photograph — kept initials']); continue; }
 
   const buf = await sharp(path.join(FROM, file))
     .resize(PX, PX, { fit: 'cover', position: 'top' })
@@ -71,7 +74,7 @@ for (const m of members) {
     .toBuffer();
 
   const uri = 'data:image/webp;base64,' + buf.toString('base64');
-  const from = `<div class="av">${m.initials}</div><div class="nm">${m.name.replace(/&/g, '&amp;')}</div>`;
+  const from = `<div class="av">${m.inner}</div><div class="nm">${m.name.replace(/&/g, '&amp;')}</div>`;
   const to = `<div class="av"><img src="${uri}" alt=""></div>` +
              `<div class="nm">${m.name.replace(/&/g, '&amp;')}</div>`;
 
